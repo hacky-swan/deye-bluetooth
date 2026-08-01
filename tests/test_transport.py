@@ -19,14 +19,19 @@ from custom_components.deye_ble import transport as t
 class FakeBleakClient:
     """Minimal BleakClient stand-in with controllable teardown behaviour."""
 
-    def __init__(self, *, disconnect_hangs: bool = False):
+    def __init__(
+        self, *, disconnect_hangs: bool = False, start_notify_raises: bool = False
+    ):
         self._disconnect_hangs = disconnect_hangs
+        self._start_notify_raises = start_notify_raises
         self.start_notify_called = False
         self.stop_notify_called = False
         self.disconnect_called = False
 
     async def start_notify(self, _char, _cb) -> None:
         self.start_notify_called = True
+        if self._start_notify_raises:
+            raise RuntimeError("br-connection-canceled")
 
     async def stop_notify(self, _char) -> None:
         self.stop_notify_called = True
@@ -78,6 +83,40 @@ async def test_disconnect_calls_client_disconnect_on_happy_path(patch_connect):
 
     assert client.stop_notify_called is True
     assert client.disconnect_called is True
+    assert transport._client is None
+
+
+@pytest.mark.asyncio
+async def test_connect_releases_link_when_start_notify_fails(patch_connect):
+    # The leak fix: establish_connection has already opened the GATT link, so a
+    # start_notify failure must release it. Otherwise the abandoned connection
+    # holds the logger's single central slot, the logger stops advertising, and
+    # no amount of reloading the integration recovers it — only a proxy restart.
+    client = FakeBleakClient(start_notify_raises=True)
+    patch_connect(client)
+
+    transport = t.DeyeBleTransport(ble_device=object())
+
+    with pytest.raises(t.DeyeBleError):
+        await transport.connect()
+
+    assert client.disconnect_called is True
+    assert transport._client is None
+
+
+@pytest.mark.asyncio
+async def test_connect_raises_deye_error_when_establish_connection_fails(monkeypatch):
+    # Bleak's own exception types must not leak past the transport: the
+    # coordinator's failure grace keys off DeyeBleError.
+    async def _boom(_cls, _device, _name, max_attempts=0):
+        raise RuntimeError("no route to proxy")
+
+    monkeypatch.setattr(t, "establish_connection", _boom)
+    transport = t.DeyeBleTransport(ble_device=object())
+
+    with pytest.raises(t.DeyeBleError):
+        await transport.connect()
+
     assert transport._client is None
 
 

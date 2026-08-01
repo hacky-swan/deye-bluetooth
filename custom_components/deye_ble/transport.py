@@ -67,13 +67,26 @@ class DeyeBleTransport:
         # Use bleak-retry-connector — the resilient path HA expects. It routes
         # through the ESP32 proxies, retries transient failures, and handles the
         # reconnect churn that raw BleakClient.connect() does not.
-        self._client = await establish_connection(
-            BleakClient,
-            self._device,
-            self._name,
-            max_attempts=CONNECT_ATTEMPTS,
-        )
-        await self._client.start_notify(NOTIFY_CHAR, self._on_notify)
+        try:
+            self._client = await establish_connection(
+                BleakClient,
+                self._device,
+                self._name,
+                max_attempts=CONNECT_ATTEMPTS,
+            )
+        except Exception as e:  # noqa: BLE001 — connect can raise many bleak errors
+            raise DeyeBleError(f"connect failed: {e}") from e
+        # start_notify can raise a raw bleak error. The GATT connection is ALREADY
+        # open at this point, so on failure we MUST release it: the logger accepts
+        # a single central and stops advertising while held, so a leaked link
+        # wedges the inverter (and eats a proxy slot) until the ESP32 proxy is
+        # restarted — an integration reload cannot undo it. Re-raise as
+        # DeyeBleError so the coordinator's failure grace rides it out.
+        try:
+            await self._client.start_notify(NOTIFY_CHAR, self._on_notify)
+        except Exception as e:  # noqa: BLE001 — notify can raise many bleak errors
+            await self.disconnect()
+            raise DeyeBleError(f"start_notify failed: {e}") from e
 
     async def disconnect(self) -> None:
         """Tear down the session, but never block on it.
@@ -81,23 +94,21 @@ class DeyeBleTransport:
         stop_notify and disconnect are best-effort: a flaky proxy link can leave
         either hanging, and if disconnect stalls it would hold the coordinator's
         BLE lock forever, wedging every subsequent poll and write until HA
-        restarts. Bound both with a timeout and always drop the client.
+        restarts. Bound both with a timeout and always drop the client. Each call
+        is also shielded, so a poll cancelled mid-teardown still lets the release
+        finish in the background instead of abandoning a half-open link.
         """
         client, self._client = self._client, None
         if client is None:
             return
-        try:
-            await asyncio.wait_for(
-                client.stop_notify(NOTIFY_CHAR), self._disconnect_timeout
-            )
-        except Exception:  # noqa: BLE001 — best-effort on teardown
-            pass
-        try:
-            await asyncio.wait_for(
-                client.disconnect(), self._disconnect_timeout
-            )
-        except Exception:  # noqa: BLE001 — a hung/failed disconnect must not wedge us
-            _LOGGER.debug("BLE disconnect did not complete cleanly", exc_info=True)
+        for coro, what in (
+            (client.stop_notify(NOTIFY_CHAR), "stop_notify"),
+            (client.disconnect(), "disconnect"),
+        ):
+            try:
+                await asyncio.wait_for(asyncio.shield(coro), self._disconnect_timeout)
+            except Exception:  # noqa: BLE001 — teardown is best-effort, never raises
+                _LOGGER.debug("BLE %s did not complete cleanly", what, exc_info=True)
 
     def _on_notify(self, _char, data: bytearray) -> None:
         text = bytes(data).decode("ascii", errors="replace").strip()

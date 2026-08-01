@@ -81,9 +81,14 @@ def _stub_ble_device(monkeypatch, *, present=True):
     from custom_components.deye_ble import coordinator as coord_mod
 
     device = object() if present else None
-    monkeypatch.setattr(
-        coord_mod, "async_ble_device_from_address", lambda _hass, _addr: device
-    )
+
+    def _lookup(_hass, _addr, *, connectable):
+        # Pinned: a non-connectable (advert-only) match cannot be dialled, so the
+        # coordinator must always ask for a connectable device.
+        assert connectable is True
+        return device
+
+    monkeypatch.setattr(coord_mod, "async_ble_device_from_address", _lookup)
 
 
 # --- dry-run tests -----------------------------------------------------------

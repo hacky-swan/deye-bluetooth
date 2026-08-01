@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from datetime import date
 
-from custom_components.deye_ble.helpers import daily_calc, infer_grid_connected
+from custom_components.deye_ble.helpers import (
+    daily_calc,
+    hold_spurious_total_resets,
+    infer_grid_connected,
+)
 
 _TODAY = date(2025, 6, 15)
 
@@ -73,3 +77,57 @@ def test_grid_connected_none_when_no_voltage_keys():
     # No grid-voltage reading -> unknown, not a false "disconnected".
     assert infer_grid_connected({}) is None
     assert infer_grid_connected({"solar_power": 100}) is None
+
+
+# --- hold_spurious_total_resets ---------------------------------------------
+
+def test_spurious_zero_total_held_at_last_good():
+    prev = {"total_grid_import": 2644.6}
+    current = hold_spurious_total_resets(prev, {"total_grid_import": 0.0})
+    assert current["total_grid_import"] == 2644.6
+
+
+def test_all_four_blipped_totals_held_simultaneously():
+    prev = {
+        "total_grid_import": 2644.6,
+        "total_battery_charge": 2377.7,
+        "total_battery_discharge": 2236.5,
+        "total_grid_export": 635.1,
+    }
+    current = hold_spurious_total_resets(prev, {k: 0.0 for k in prev})
+    assert current == prev
+
+
+def test_genuine_increase_passes_through():
+    prev = {"total_grid_import": 2644.6}
+    current = hold_spurious_total_resets(prev, {"total_grid_import": 2674.9})
+    assert current["total_grid_import"] == 2674.9
+
+
+def test_non_total_zero_is_not_held():
+    # Instantaneous power legitimately reads 0 — never held.
+    prev = {"grid_power": 1300}
+    current = hold_spurious_total_resets(prev, {"grid_power": 0})
+    assert current["grid_power"] == 0
+
+
+def test_no_prev_passes_through_unchanged():
+    # First cycle: nothing to hold against.
+    current = hold_spurious_total_resets(None, {"total_grid_import": 0.0})
+    assert current["total_grid_import"] == 0.0
+    current = hold_spurious_total_resets({}, {"total_grid_import": 0.0})
+    assert current["total_grid_import"] == 0.0
+
+
+def test_missing_total_in_current_is_skipped():
+    # Key not read this cycle -> no KeyError, left absent.
+    prev = {"total_grid_import": 2644.6}
+    current = hold_spurious_total_resets(prev, {"grid_power": 100})
+    assert "total_grid_import" not in current
+
+
+def test_zero_prev_does_not_hold():
+    # Legitimate cold start at 0 -> a later 0 is not treated as a reset.
+    prev = {"total_grid_import": 0.0}
+    current = hold_spurious_total_resets(prev, {"total_grid_import": 0.0})
+    assert current["total_grid_import"] == 0.0

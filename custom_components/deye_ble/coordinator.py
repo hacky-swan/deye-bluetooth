@@ -26,7 +26,12 @@ from .const import (
     MAX_WRITE_ATTEMPTS,
     WRITE_RETRY_BACKOFF,
 )
-from .helpers import async_poll, detect_drift, verify_readback
+from .helpers import (
+    async_poll,
+    detect_drift,
+    hold_spurious_total_resets,
+    verify_readback,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,7 +175,9 @@ class DeyeBleCoordinator(DataUpdateCoordinator):
         return (time.monotonic() - self._last_config_read) >= self._config_interval
 
     def _resolve_device(self):
-        ble_device = async_ble_device_from_address(self.hass, self._address)
+        ble_device = async_ble_device_from_address(
+            self.hass, self._address, connectable=True
+        )
         if ble_device is None:
             raise UpdateFailed(f"BLE device {self._address} not found")
         return ble_device
@@ -198,6 +205,11 @@ class DeyeBleCoordinator(DataUpdateCoordinator):
             for key in _CARRY_KEYS:
                 if key not in data and key in prev:
                     data[key] = prev[key]
+
+        # A BLE frame that decodes a lifetime total as 0 must not reach a
+        # total_increasing sensor — HA would log a meter reset and count the
+        # recovery as a phantom spike. Hold the last good value instead.
+        data = hold_spurious_total_resets(prev, data)
 
         # Only acknowledge the config read if it was attempted AND came back.
         if config_due and all(key in data for key in _CONFIG_KEYS):
@@ -273,7 +285,9 @@ class DeyeBleCoordinator(DataUpdateCoordinator):
         via the BLE lock (one central at a time). 100-reg reads get no BLE reply,
         so the default block size matches the small-read limit.
         """
-        ble_device = async_ble_device_from_address(self.hass, self._address)
+        ble_device = async_ble_device_from_address(
+            self.hass, self._address, connectable=True
+        )
         if ble_device is None:
             raise HomeAssistantError(f"BLE device {self._address} not found")
 
@@ -312,7 +326,9 @@ class DeyeBleCoordinator(DataUpdateCoordinator):
                 )
             return
 
-        ble_device = async_ble_device_from_address(self.hass, self._address)
+        ble_device = async_ble_device_from_address(
+            self.hass, self._address, connectable=True
+        )
         if ble_device is None:
             raise HomeAssistantError(f"BLE device {self._address} not found")
 

@@ -175,6 +175,51 @@ def detect_drift(
     return drifted
 
 
+# --- Spurious lifetime-total reset guard ------------------------------------
+
+# Lifetime cumulative energy registers (kWh) that only ever climb. A BLE frame
+# occasionally decodes one (or several) as 0; feeding that 0 to a
+# total_increasing sensor makes HA statistics treat it as a meter reset and then
+# count the recovery back up as a phantom spike (one 0-blip cost ~2.6 MWh of
+# fake grid import overnight). These keys are held at their last good value
+# until the device reports a real number again.
+_MONOTONIC_TOTAL_KEYS = (
+    "total_solar",
+    "total_grid_import",
+    "total_grid_export",
+    "total_battery_charge",
+    "total_battery_discharge",
+    "total_consumption",
+)
+
+
+def hold_spurious_total_resets(
+    prev: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Hold lifetime totals that spuriously read 0 at their last good value.
+
+    A lifetime total dropping to ``0`` (or below) while the previous cycle had a
+    positive reading is a bad BLE frame, not a real meter reset. Such keys are
+    overwritten in *current* with the previous value so the downstream
+    total_increasing sensors never see the false reset. All other keys — and any
+    genuine positive reading — pass through untouched. Mutates and returns
+    *current*.
+    """
+    if not prev:
+        return current
+    for key in _MONOTONIC_TOTAL_KEYS:
+        new = current.get(key)
+        old = prev.get(key)
+        if new is not None and old is not None and new <= 0 < old:
+            _LOGGER.warning(
+                "deye: ignoring spurious %s=%s (holding last good %s)",
+                key, new, old,
+            )
+            current[key] = old
+    return current
+
+
 # --- Daily baseline calculation --------------------------------------------
 
 def daily_calc(
