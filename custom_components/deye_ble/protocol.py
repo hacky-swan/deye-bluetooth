@@ -69,6 +69,37 @@ def build_write(address: int, value: int) -> bytes:
     return _with_crc(body)
 
 
+def build_write_block(address: int, values: list[int]) -> bytes:
+    """Modbus func 0x10 frame writing *values* to a CONTIGUOUS register range.
+
+    One frame, quantity = len(values), rather than one frame per register.
+
+    THIS IS A CORRECTNESS PROPERTY FOR THE CLOCK, not a style preference.
+    Writing 0x003E-0x0040 as three separate quantity-1 frames corrupts the year
+    byte roughly four times in five on this hardware — measured 2026-08-15 in an
+    interleaved trial where only the frame shape varied: block 0/5 corrupt,
+    single 4/5 corrupt, every clean block write sitting between two failing
+    single writes so logger drift could not masquerade as the effect. The
+    corrupt years land as 0x1A + N*0x30, consistent with a byte passing through
+    an extra ASCII hex conversion at an offset that only the single-register
+    layout produces.
+
+    build_write is deliberately left alone: every other control here writes one
+    register at a time and none of them show this fault.
+    """
+    if not values:
+        raise ValueError("block write needs at least one value")
+    body = bytes((
+        SLAVE, FUNC_WRITE,
+        (address >> 8) & 0xFF, address & 0xFF,
+        (len(values) >> 8) & 0xFF, len(values) & 0xFF,   # quantity
+        2 * len(values),                                  # byte count
+    ))
+    for value in values:
+        body += bytes(((value >> 8) & 0xFF, value & 0xFF))
+    return _with_crc(body)
+
+
 # --- AT wrapping -----------------------------------------------------------
 
 def wrap_read(frame: bytes) -> bytes:

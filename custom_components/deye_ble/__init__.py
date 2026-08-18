@@ -83,6 +83,25 @@ async def async_setup_entry(hass, entry) -> bool:
 
     hass.services.async_register(DOMAIN, "dump_registers", _dump_registers_service)
 
+    async def _sync_clock_service(call):
+        """Set the inverter RTC to HA's local time (see coordinator.async_sync_clock).
+
+        Refreshes afterwards so the clock/drift entities reflect the sync before
+        this call returns — a caller that verifies the result by reading them
+        would otherwise be looking at a pre-sync snapshot. async_refresh (not
+        async_request_refresh) because that one is debounced and returns before
+        the poll has actually happened.
+        """
+        # min_drift is optional and absent by default, so a human calling this
+        # service always gets a sync. Only the automation passes a threshold.
+        raw = call.data.get("min_drift")
+        await coordinator.async_sync_clock(
+            min_drift=None if raw is None else int(raw)
+        )
+        await coordinator.async_refresh()
+
+    hass.services.async_register(DOMAIN, "sync_clock", _sync_clock_service)
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 

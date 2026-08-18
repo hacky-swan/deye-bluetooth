@@ -88,3 +88,101 @@ Cloud control writes arrive on `user/down/control/order` as Deye opType-4 (read
 list) / opType-5 (write list) wrapping the same registers — confirming the BLE
 register addresses match the cloud's. Example work-mode write set `0x008E`, and
 the readback ack echoed the new value.
+
+## The logger caches read responses
+
+Measured 2026-08-14 by reading the RTC block (`0x003E`, count 3) at 1 Hz over a
+single BLE session with **no writes at all**. The inverter clock advances one
+second per second, so any run of byte-identical frames is the logger replaying a
+cached response rather than asking the inverter:
+
+```text
+22:19:30-35   0103061A080E161316AD5C   2026-08-14 22:19:22    6 identical reads
+22:19:36-37   0103061A080E16131EAC9A   2026-08-14 22:19:30    2 identical
+22:19:38-45   0103061A080E1613202D4A   2026-08-14 22:19:32    8 identical
+22:19:46-47   0103061A080E1613282C8C   2026-08-14 22:19:40    2 identical
+22:19:48-54   0103061A080E16132AAD4D   2026-08-14 22:19:42    7 identical
+```
+
+The window is **variable and reaches at least 8 seconds**. Five runs do not
+establish a maximum, so no fixed delay should be treated as "long enough".
+
+This affects every reader on this transport, not just the clock.
+
+### Consequence 1 — a read-back can lie in both directions
+
+A read taken inside the window carries no information about a write just issued.
+It can report the *old* value (failing a write that actually landed) and — the
+dangerous direction — it can report a plausible *pre-write* value while the
+write has actually corrupted the register, i.e. a silent false pass.
+
+Anything verifying a write over this transport must therefore verify on
+**freshness**, not elapsed time: keep the frame seen before the write, and
+discard any later frame identical to it. The clock sync additionally requires
+two consecutive *distinct* frames, because the cache can refresh from the
+inverter a moment before a write lands, producing a frame that is genuinely new
+yet still predates the write. See `coordinator._verify_fresh`.
+
+### Consequence 2 — instantaneous drift readings are biased
+
+Because a served frame can be up to the cache age old, every single-sample
+drift figure is biased **negative** (the inverter looks slower than it is) by up
+to that age. Concretely, in the run above each fresh frame starts ~6 s behind
+site time, matching the −6 s the drift sensor reported, and then ages a further
+2–8 s before refreshing.
+
+- Multi-hour **means keep their shape** — the bias is bounded and roughly
+  constant, so the ~3.1 s/day free-run rate measured over 2026-08-09 → 08-13
+  stands.
+- Individual figures do not. "The clock is 9 seconds slow" is not a supportable
+  claim from one sample; it is drift plus up to ~8 s of staleness.
+- It also explains part of the ±5 s sample scatter previously attributed to
+  noise. Variable cache age is a mechanism, not randomness, and it is quantised
+  by the refresh cycle rather than normally distributed.
+
+
+## Write the clock as ONE frame
+
+Three separate quantity-1 `0x10` frames covering `0x003E`-`0x0040` corrupt the
+year byte on this hardware. One contiguous quantity-3 frame does not.
+
+Interleaved trial, 2026-08-15, Time Sync ON, every write targeting "now", with
+only the frame shape varying:
+
+```text
+1 block  ok        1 single  2122 CORRUPT
+2 block  ok        2 single  2074 CORRUPT
+3 block  ok        3 single  2074 CORRUPT
+4 block  ok        4 single  2074 CORRUPT
+5 block  ok        5 single  ok
+
+BLOCK   0/5 corrupt        SINGLE  4/5 corrupt
+```
+
+Interleaved deliberately: every clean block write sits between two failing
+single writes, so drift in the logger's state over the run cannot masquerade as
+the effect.
+
+The corrupt years are `0x1A + N*0x30` — 0x4A (2074) and 0x7A (2122), never
+anything else across six samples. `0x30` is the ASCII offset for digits, and
+these frames travel as ASCII hex inside `AT+INVDATA=`, so the pattern is
+consistent with a byte passing through one or two extra hex-to-text conversions
+at an offset that only the single-register layout produces. The month, day,
+hour, minute and second bytes were correct in every corrupt sample; the year is
+simply the field where `+0x30` still yields a plausible-looking value instead of
+an obviously invalid one.
+
+Every corrupt frame passed CRC, so this is not transmission noise — the wrong
+value was checksummed correctly by whatever produced it. And the `0x10` ack
+echoes only address and quantity, never the values, so an ack can never confirm
+what was written. That is why the clock is verified by read-back.
+
+`build_write` is deliberately unchanged: every other control here writes a
+single register and none show this fault.
+
+### The falling edge is still required
+
+A block write does not commit on its own. Ten block writes with Time Sync left
+OFF and no toggle — targets varied across 2020-2035, all months, hours outside
+the TOU windows — produced **0/10 commits**, with the RTC ticking its own time
+throughout. The commit sequence is unchanged: arm, write, clear.

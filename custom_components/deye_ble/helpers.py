@@ -7,7 +7,7 @@ imports async_poll from here.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Protocol
 
 from . import registers as r
@@ -70,6 +70,95 @@ def infer_grid_connected(data: dict[str, Any]) -> bool | None:
     if not voltages:
         return None
     return max(voltages) > GRID_PRESENT_VOLTAGE
+
+
+# --- Inverter clock drift ----------------------------------------------------
+
+def clock_drift_seconds(
+    inverter_clock: datetime | None,
+    now: datetime,
+) -> int | None:
+    """Seconds the inverter RTC is ahead of *now* (negative = running behind).
+
+    Both sides are site wall clock: the inverter reports a bare local time, and
+    *now* is HA's local time. A timezone on *now* is dropped rather than used to
+    convert, since there is nothing on the other side to convert against.
+
+    Returns ``None`` when the clock could not be read, so a missing reading is
+    never reported as zero drift.
+
+    Callers must compute this at the moment a *fresh* clock is decoded and carry
+    the result forward with it. Recomputing against a carried-forward clock would
+    make drift climb one second per second between config reads — a permanently
+    alarming number that says nothing about the inverter.
+    """
+    if inverter_clock is None:
+        return None
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    return round((inverter_clock - now).total_seconds())
+
+
+_SECONDS_PER_DAY = 24 * 60 * 60
+
+
+def time_of_day_drift_seconds(
+    inverter_clock: datetime | None,
+    now: datetime,
+) -> int | None:
+    """Wall-clock-of-day drift in seconds, ignoring the date entirely.
+
+    Same sign convention and same snapshot rules as :func:`clock_drift_seconds`
+    (positive = inverter ahead, ``None`` = unread, measure it once against a
+    fresh reading), but the date is discarded.
+
+    This exists because the two faults are independent: an RTC that is a year
+    out AND ~90 minutes fast reports a total drift of about -365 days, in which
+    the minutes are invisible. A repeating time-of-day offset is the fingerprint
+    of something actively rewriting the clock, so it needs its own number.
+
+    The result is wrapped to the shortest way round the 24h circle, i.e. always
+    within +/-12h: 00:01 against 23:59 is +120 s, never -86280. Without that, a
+    tiny offset straddling midnight would read as a near-24h jump — exactly what
+    a rogue writer looks like. Exactly 12h apart resolves to +43200.
+    """
+    if inverter_clock is None:
+        return None
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+
+    def _seconds_into_day(value: datetime) -> int:
+        return value.hour * 3600 + value.minute * 60 + value.second
+
+    delta = (_seconds_into_day(inverter_clock) - _seconds_into_day(now)) % _SECONDS_PER_DAY
+    if delta > _SECONDS_PER_DAY // 2:
+        delta -= _SECONDS_PER_DAY
+    return delta
+
+
+def clock_within_tolerance(
+    words: list[int],
+    now: datetime,
+    tolerance: int,
+) -> bool:
+    """Whether an RTC readback is close enough to *now* to call the write good.
+
+    The clock is the one control that cannot use the strict
+    :func:`verify_readback` every other register uses: it ticks throughout the
+    commit sequence, so the readback is *expected* to differ from what was
+    written. It is judged on drift instead — accepted when within *tolerance*
+    seconds of a freshly taken *now*.
+
+    An undecodable frame is a failure, never a pass: the observed bad write
+    (year byte 0x1A landing as 0x7A, giving 2122) decodes fine and is caught by
+    the tolerance, but a frame that decodes to nothing tells us the write cannot
+    be confirmed, and unconfirmed must not read as confirmed.
+    """
+    clock = r.decode_clock(words)
+    if clock is None:
+        return False
+    drift = clock_drift_seconds(clock, now)
+    return abs(drift) <= tolerance
 
 
 # --- Logger SN validation ----------------------------------------------------

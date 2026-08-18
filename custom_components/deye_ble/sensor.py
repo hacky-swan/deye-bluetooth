@@ -15,13 +15,14 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_LOGGER_SN, DEVICE_NAME, DOMAIN
+from .const import CONF_LOGGER_SN, DEVICE_NAME, DOMAIN, SYNC_RESULTS
 from .helpers import daily_calc
 
 # (key, name, unit, device_class, state_class, icon, precision)
@@ -64,6 +65,10 @@ async def async_setup_entry(
     coordinator = hass.data[DOMAIN][entry.entry_id]
     entities = [DeyeSensor(coordinator, entry, *row) for row in SENSORS]
     entities.append(DeyeDailyConsumptionSensor(coordinator, entry))
+    entities.append(DeyeInverterClockSensor(coordinator, entry))
+    entities.append(DeyeClockSyncResultSensor(coordinator, entry))
+    entities.append(DeyeClockDriftSensor(coordinator, entry))
+    entities.append(DeyeClockTimeOfDayDriftSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -99,6 +104,123 @@ class DeyeSensor(CoordinatorEntity, SensorEntity):
         if self.coordinator.data is None:
             return None
         return self.coordinator.data.get(self._key)
+
+
+# -- Inverter clock (diagnostic) ----------------------------------------------
+
+class DeyeInverterClockSensor(DeyeSensor):
+    """The inverter's own real-time clock, as read on the config cycle.
+
+    The device reports a bare wall clock with no timezone; HA's timestamp
+    device class needs an aware datetime, so site time is attached here — at the
+    entity boundary, where the assumption is visible — rather than in the decode.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator, entry: ConfigEntry):
+        super().__init__(
+            coordinator, entry, "inverter_clock", "Inverter Clock", None,
+            SensorDeviceClass.TIMESTAMP, None, "mdi:clock-outline", None,
+        )
+
+    @property
+    def native_value(self):
+        value = super().native_value
+        if value is None:
+            return None
+        return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+
+
+
+class DeyeClockSyncResultSensor(CoordinatorEntity, SensorEntity):
+    """The result of the last clock sync — deliberately NOT a device reading.
+
+    Availability is fixed True rather than following the coordinator, and that
+    is the whole point of the entity existing separately. Every other entity
+    here reports what the inverter currently says, so when polling fails they
+    are rightly unavailable — and an unavailable entity has its attributes
+    stripped by HA entirely. That would take the sync result down with the
+    telemetry: a sync that verified, followed by one failed poll, would leave a
+    verifier seeing nothing and calling a good sync a failure. What we know
+    about a completed sync does not stop being true when the radio drops.
+
+    Reads "unknown" until a sync has actually run — never a fabricated success.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Clock Sync Result"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:clock-check-outline"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = SYNC_RESULTS
+
+    def __init__(self, coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        sn = entry.data[CONF_LOGGER_SN]
+        self._attr_unique_id = f"{sn}_clock_sync_result"
+        self._attr_device_info = _device_info(sn)
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self):
+        return (self.coordinator.data or {}).get("clock_sync_result")
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        if "clock_sync_result" not in data:
+            return None
+        return {
+            # sync_id identifies the run: a verifier compares it against the
+            # value it saw before calling the service. sync_at is for humans —
+            # comparing timestamps would assume a monotonic wall clock, which
+            # is precisely what this feature exists to fix.
+            "sync_id": data["clock_sync_id"],
+            "sync_attempts": data["clock_sync_attempts"],
+            "sync_at": data["clock_sync_at"],
+        }
+
+
+class DeyeClockDriftSensor(DeyeSensor):
+    """How far the inverter clock had wandered at the last clock read.
+
+    Positive means the inverter is running ahead of HA. The value is a snapshot
+    taken when the clock was read (up to CONFIG_READ_INTERVAL old), not a live
+    countdown — see helpers.clock_drift_seconds.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator, entry: ConfigEntry):
+        super().__init__(
+            coordinator, entry, "inverter_clock_drift", "Inverter Clock Drift", "s",
+            SensorDeviceClass.DURATION, SensorStateClass.MEASUREMENT,
+            "mdi:clock-alert-outline", 0,
+        )
+
+
+class DeyeClockTimeOfDayDriftSensor(DeyeSensor):
+    """Clock drift with the date ignored — the time-of-day component alone.
+
+    Kept alongside the total drift, not instead of it: a wrong year is a real
+    fault worth seeing, but it swamps the minutes-scale offset that identifies
+    something actively rewriting the RTC. Wrapped to +/-12h so a small offset
+    straddling midnight can't masquerade as a near-24h jump.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator, entry: ConfigEntry):
+        super().__init__(
+            coordinator, entry, "inverter_time_of_day_drift",
+            "Inverter Clock Drift (Time of Day)", "s",
+            SensorDeviceClass.DURATION, SensorStateClass.MEASUREMENT,
+            "mdi:clock-fast", 0,
+        )
 
 
 # -- Daily consumption (RestoreEntity, midnight baseline) ---------------------

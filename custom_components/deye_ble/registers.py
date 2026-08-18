@@ -17,6 +17,8 @@ daily_grid_import sensor.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 
 # --- Poll plan --------------------------------------------------------------
 # Minimal set of blocks that covers every telemetry key below. The Deye app
@@ -36,6 +38,7 @@ READ_BLOCKS: list[tuple[int, int]] = [
 
 # Control registers, read on the slower config cycle (P3).
 CONTROL_BLOCKS: list[tuple[int, int]] = [
+    (0x003E, 3),   # 0x003E..0x0040 inverter real-time clock
     (0x0068, 1),   # 0x0068 zero-export power (W, signed)
     (0x006C, 2),   # 0x006C max charge current, 0x006D max discharge current (A)
     (0x0073, 3),   # 0x0073/0x0074/0x0075 batt shutdown/restart/low SOC (%)
@@ -43,10 +46,37 @@ CONTROL_BLOCKS: list[tuple[int, int]] = [
     (0x0095, 2),   # 0x0095 charge window start, 0x0096 charge window end (HHMM)
     (0x00A6, 6),   # 0x00A6..0x00AB TOU slot 1-6 target SOC (%) — charge + discharge
     (0x00B2, 14),  # 0x00B2 peak-shaving flags + 0x00BE/0x00BF gen/grid shave power
+    (0x00E4, 1),   # 0x00E4 System Time panel flags — bit 0 is Time Sync
 ]
 
 
 # --- Control register addresses ---------------------------------------------
+
+# Inverter real-time clock, three contiguous registers packed as byte pairs:
+#   0x003E  hi = year-2000, lo = month
+#   0x003F  hi = day,       lo = hour
+#   0x0040  hi = minute,    lo = second
+# Confirmed against two captured cloud writes taken at different times —
+# 0x1A08/0x0908/0x3800 ("System Time 2026/08/09 08:56") and 0x1A08/0x0909/0x1E00
+# (the app's "set 09:30") — see
+# local-deye-cloud/docs/inverter-clock-2026-08-09.md. Writing these registers
+# alone does nothing: the RTC latches them only on the Time Sync falling edge
+# below (coordinator.async_sync_clock drives the full sequence).
+REG_CLOCK = 0x003E
+CLOCK_WORD_COUNT = 3
+
+# System Time panel flags. Bit 0 is Time Sync, and the RTC commits the staged
+# clock registers when it goes 1 -> 0. Live values are 0x0AEB (on) / 0x0AEA
+# (off): the app only ever writes the low byte, and the high byte carries the
+# panel's other controls (AM/PM, Auto Dim, Beep, Factory Reset) — so this is
+# always a read-modify-write via set_flag, never a literal.
+#
+# Time Sync OFF also stops the logger's cloud calibration reaching the RTC.
+# Since the commit edge *ends* with the bit clear, any writer must put it back
+# where it found it, or setting the clock silently disables the only other
+# mechanism that corrects it. That is the origin of the year-out fault.
+REG_TIME_SYNC = 0x00E4
+TIME_SYNC_MASK = 0x0001
 
 REG_ZERO_EXPORT_POWER = 0x0068      # zero-export power / grid-comp offset (W, signed)
 REG_MAX_CHARGE_CURRENT = 0x006C     # battery max charge current (A)
@@ -179,7 +209,7 @@ def _lookup(words_by_reg: dict[int, list[int]], reg: int) -> int | None:
     return None
 
 
-def decode(words_by_reg: dict[int, list[int]]) -> dict[str, float | int | str]:
+def decode(words_by_reg: dict[int, list[int]]) -> dict[str, float | int | str | datetime]:
     """Decode raw register words into HA entity key/value pairs.
 
     *words_by_reg* maps each polled block's start address to its list of
@@ -187,7 +217,7 @@ def decode(words_by_reg: dict[int, list[int]]) -> dict[str, float | int | str]:
     registers were not present in *words_by_reg* are omitted, so a partial
     poll yields a partial dict rather than wrong values.
     """
-    result: dict[str, float | int | str] = {}
+    result: dict[str, float | int | str | datetime] = {}
 
     for key, (reg, scale, signed, offset) in _DECODE_MAP.items():
         raw = _lookup(words_by_reg, reg)
@@ -210,6 +240,21 @@ def decode(words_by_reg: dict[int, list[int]]) -> dict[str, float | int | str]:
         result["grid_peak_shaving"] = bool(flags_raw & GRID_PEAK_SHAVE_MASK)
         result["gen_peak_shaving"] = bool(flags_raw & GEN_PEAK_SHAVE_MASK)
 
+    # Inverter RTC — three packed registers, decoded together. An implausible
+    # frame yields no key at all: undecoded beats quietly wrong for a clock.
+    clock_words = [_lookup(words_by_reg, REG_CLOCK + i) for i in range(CLOCK_WORD_COUNT)]
+    if all(w is not None for w in clock_words):
+        clock = decode_clock(clock_words)
+        if clock is not None:
+            result["inverter_clock"] = clock
+
+    # Time Sync enable — bit 0 of the packed System Time panel register. Only
+    # the decoded bool is published; a writer must re-read the raw word inside
+    # its own session, since the other bits are not ours to replay.
+    time_sync_raw = _lookup(words_by_reg, REG_TIME_SYNC)
+    if time_sync_raw is not None:
+        result["time_sync"] = bool(time_sync_raw & TIME_SYNC_MASK)
+
     # TOU charge window times are stored as HHMM; decode to "HH:MM" strings.
     # An unset/invalid slot value (e.g. 0xFFFF) is omitted rather than published.
     for key, reg in (("charge_start", REG_TOU_SLOT2_START), ("charge_end", REG_TOU_SLOT3_START)):
@@ -225,6 +270,44 @@ def decode(words_by_reg: dict[int, list[int]]) -> dict[str, float | int | str]:
 
 
 # --- Encoders ---------------------------------------------------------------
+
+def decode_clock(words: list[int]) -> datetime | None:
+    """Decode the three packed RTC registers to a naive local ``datetime``.
+
+    The inverter stores a bare wall clock with no timezone, so the result is
+    deliberately naive — attaching a timezone below the entity layer would
+    invent information the device never reported.
+
+    Returns ``None`` when the frame does not describe a real date/time (the
+    ``datetime`` constructor rejects month 13, day 32, hour 24, and friends).
+    """
+    if len(words) < CLOCK_WORD_COUNT:
+        return None
+    year, month = 2000 + (words[0] >> 8), words[0] & 0xFF
+    day, hour = words[1] >> 8, words[1] & 0xFF
+    minute, second = words[2] >> 8, words[2] & 0xFF
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
+def encode_clock(value: datetime) -> list[int]:
+    """Encode a local ``datetime`` to the three packed RTC registers.
+
+    Inverse of :func:`decode_clock`. Only the wall-clock fields are used, so an
+    aware value encodes as the site time it displays — the inverter has no
+    timezone to convert into. The words are staged in the registers; committing
+    them is the Time Sync edge's job (see REG_TIME_SYNC).
+    """
+    if not 2000 <= value.year <= 2255:
+        raise ValueError(f"year out of register range: {value.year}")
+    return [
+        ((value.year - 2000) << 8) | value.month,
+        (value.day << 8) | value.hour,
+        (value.minute << 8) | value.second,
+    ]
+
 
 def encode_work_mode(label: str) -> int:
     """Encode a work-mode label to its register value (0, 1, or 2)."""
