@@ -1,0 +1,60 @@
+sync_clock:
+  name: Sync clock
+  description: >-
+    Set the inverter's real-time clock to Home Assistant's local time. Nothing
+    else corrects this RTC — the logger's cloud calibration reaches the logger,
+    not the inverter — so this is the only mechanism that fixes a wrong clock.
+  fields:
+    min_drift:
+      name: Minimum drift
+      description: >-
+        Only write when the clock is out by at least this many seconds. Omit it
+        and the sync always writes, which is what a person calling this by hand
+        wants. The daily automation passes a threshold because every write is a
+        chance to corrupt the RTC and it only loses about 3 seconds a day.
+      required: false
+      example: 30
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
+          mode: box
+
+dump_registers:
+  name: Dump registers
+  description: >-
+    Diagnostic. Sweep a register range and write the result to
+    deye_register_dump.txt in the config directory. Holds the BLE link for the
+    whole sweep, so a wide range blocks normal polling for a while.
+  fields:
+    start:
+      name: Start register
+      description: First register to read, inclusive.
+      required: false
+      example: 0
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    end:
+      name: End register
+      description: Last register to read, exclusive.
+      required: false
+      example: 768
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    block:
+      name: Block size
+      description: Registers to request per frame.
+      required: false
+      example: 16
+      selector:
+        number:
+          min: 1
+          max: 64
+          mode: box

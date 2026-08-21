@@ -104,11 +104,34 @@ parking it inside that window would exercise a schedule nobody asked for.
 | 3 | Recover via service | -5 s, `ok`, 1 attempt, 21 s wall time |
 | 4 | Skew -1 h (RTC 15:28) | held across 2.5 min of polling |
 | 5 | Recover via service | -5 s, `ok`, **2 attempts**, 14 s wall time |
+| 8 | Press `button.deye_inverter_ble_sync_clock` | -5 s, `ok`, 2 attempts, 70 s |
 | 6 | `min_drift: 300` with drift ~5 s | `skipped`, 0 attempts |
 | 7 | Trigger `automation.inverter_daily_clock_sync` | fresh `sync_id`, `skipped`, no alert raised |
 
 `binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled` read `on` before and
 after every step: Time Sync was never left disabled.
+
+### The retries were the radio, not the write
+
+Two of the eight syncs reported `sync_attempts: 2`. Neither was a bad write —
+the log gives the cause outright:
+
+```
+inverter clock sync attempt 1/3 failed: connect failed:
+Failed to connect after 3 attempt(s): Timeout waiting for connect response
+after 20.0s
+```
+
+The link never opened, so no frame reached the inverter. **Every write that did
+reach the RTC verified on its first attempt** — 8 syncs, 0 corrupt writes,
+against the 4-in-5 year-byte corruption that single-register writes produced on
+2026-08-15. That is the one-frame block write earning its place.
+
+Worth stating plainly because the two failure modes want opposite fixes: a bad
+write is a protocol problem and would justify more verification, while a refused
+connection is the logger's radio and is exactly what the retry budget is for.
+Reading `sync_attempts: 2` as evidence about the write would send anyone
+debugging this in the wrong direction.
 
 The three entity IDs `deploy/deye_clock.yaml` predicted from the device slug are
 confirmed real — `sensor.deye_inverter_ble_clock_sync_result`,
