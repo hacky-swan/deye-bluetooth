@@ -563,6 +563,21 @@ class DeyeBleCoordinator(DataUpdateCoordinator):
                 f"— cloud clock calibration is left disabled: {enable_error}"
             )
 
+    async def async_sync_clock_and_refresh(self, min_drift: int | None = None) -> None:
+        """Sync the clock, then poll, so the caller sees the result it caused.
+
+        The two steps belong together at every entry point a human or an
+        automation uses. mark_config_dirty alone only arms the NEXT poll, which
+        can be a full scan interval away; a caller that verifies the sync by
+        reading the drift entity would be looking at the pre-sync snapshot.
+
+        async_refresh, not async_request_refresh: that one is debounced and
+        returns before the poll has actually happened, which puts the same stale
+        read back in front of the caller by a different route.
+        """
+        await self.async_sync_clock(min_drift=min_drift)
+        await self.async_refresh()
+
     @staticmethod
     def _classify(skipped: bool, verdict: str, enable_error: Exception | None) -> str:
         """Map the sequence's end state to a published outcome.
