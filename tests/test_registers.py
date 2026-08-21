@@ -9,6 +9,8 @@ decode offsets/scaling against genuine device bytes — not against re-derived
 assumptions. Every expected value was confirmed by a same-second BLE-vs-HA
 comparison (local-deye-cloud/docs/stats-register-decode.md).
 """
+from datetime import datetime
+
 import pytest
 
 from custom_components.deye_ble import protocol as p
@@ -349,3 +351,108 @@ def test_hhmm_decode_rejects_invalid():
 ])
 def test_signed16(raw, expected):
     assert r._signed16(raw) == expected
+
+
+# --- Inverter real-time clock (0x003E-0x0040) -------------------------------
+# Anchored on the cloud write captured 2026-08-09 at the moment the app showed
+# "System Time 2026/08/09 08:56" (local-deye-cloud/docs/inverter-clock-2026-08-09.md).
+
+CLOCK_WORDS = [0x1A08, 0x0908, 0x3800]
+CLOCK_DATETIME = datetime(2026, 8, 9, 8, 56, 0)
+
+
+def clock_frame(words: list[int] = None) -> str:
+    """Build a valid CRC'd +ok= read response carrying the three clock words."""
+    words = CLOCK_WORDS if words is None else words
+    body = bytes([p.SLAVE, p.FUNC_READ, 2 * len(words)])
+    for w in words:
+        body += bytes(((w >> 8) & 0xFF, w & 0xFF))
+    return "+ok=" + (body + p.crc16(body)).hex().upper()
+
+
+def test_clock_decodes_captured_frame():
+    assert r.decode_clock(CLOCK_WORDS) == CLOCK_DATETIME
+
+
+def test_clock_encodes_to_captured_frame():
+    # Byte-for-byte against the captured cloud write — this is what catches a
+    # hi/lo swap if the register layout is ever re-derived.
+    assert r.encode_clock(CLOCK_DATETIME) == CLOCK_WORDS
+
+
+@pytest.mark.parametrize("value", [
+    datetime(2026, 8, 9, 8, 56, 0),
+    datetime(2026, 1, 1, 0, 0, 0),        # midnight, single-digit month + day
+    datetime(2026, 1, 5, 9, 7, 3),        # every field single-digit: hi/lo confusion shows
+    datetime(2026, 12, 31, 23, 59, 59),   # every field at its maximum
+])
+def test_clock_round_trip(value):
+    assert r.decode_clock(r.encode_clock(value)) == value
+
+
+@pytest.mark.parametrize("words,why", [
+    ([0x1A00, 0x0908, 0x3800], "month 0"),
+    ([0x1A0D, 0x0908, 0x3800], "month 13"),
+    ([0x1A08, 0x2008, 0x3800], "day 32"),
+    ([0x1A08, 0x0918, 0x3800], "hour 24"),
+    ([0x1A08, 0x0908, 0x3C00], "minute 60"),
+    ([0x1A08, 0x0908, 0x383C], "second 60"),
+    ([0x1A08, 0x0908], "short frame"),
+])
+def test_clock_decode_rejects_implausible(words, why):
+    # Undecoded beats quietly wrong: a bad frame yields nothing, not a guess.
+    assert r.decode_clock(words) is None, why
+
+
+def test_clock_encode_rejects_unrepresentable_year():
+    with pytest.raises(ValueError):
+        r.encode_clock(datetime(1999, 1, 1, 0, 0, 0))
+
+
+def test_clock_decodes_second_captured_frame():
+    # Independent second anchor: the app's "set 09:30" write, captured
+    # 2026-08-09. Confirms 0x0040 packs minute in the HIGH byte — two captures
+    # from different times agreeing is what pins the byte order.
+    assert r.decode_clock([0x1A08, 0x0909, 0x1E00]) == datetime(2026, 8, 9, 9, 30, 0)
+
+
+def test_decode_publishes_clock():
+    assert r.decode({0x003E: CLOCK_WORDS})["inverter_clock"] == CLOCK_DATETIME
+
+
+def test_decode_omits_clock_when_block_absent(poll):
+    # Telemetry-only poll: no clock block read, so no key at all.
+    assert "inverter_clock" not in poll
+
+
+def test_decode_omits_implausible_clock():
+    assert "inverter_clock" not in r.decode({0x003E: [0x1A0D, 0x0908, 0x3800]})
+
+
+# --- Time Sync flag (0x00E4 bit 0) ------------------------------------------
+# Live values: 0x0AEA = sync off, 0x0AEB = sync on. Only the low byte is ever
+# written by the app; the high byte carries unrelated System Time panel bits
+# (AM/PM, Auto Dim, Beep, Factory Reset), so every change must be a
+# read-modify-write. See local-deye-cloud/docs/inverter-clock-2026-08-09.md.
+
+def test_time_sync_mask_is_bit0():
+    assert r.TIME_SYNC_MASK == 0x0001
+
+
+def test_time_sync_enable_preserves_the_other_panel_bits():
+    assert r.set_flag(0x0AEA, r.TIME_SYNC_MASK, True) == 0x0AEB
+
+
+def test_time_sync_disable_preserves_the_other_panel_bits():
+    assert r.set_flag(0x0AEB, r.TIME_SYNC_MASK, False) == 0x0AEA
+
+
+@pytest.mark.parametrize("raw,expected", [(0x0AEB, True), (0x0AEA, False)])
+def test_decode_publishes_time_sync(raw, expected):
+    # Time Sync off means the logger's cloud calibration cannot reach the RTC —
+    # the silent failure this entity exists to make visible.
+    assert r.decode({r.REG_TIME_SYNC: [raw]})["time_sync"] is expected
+
+
+def test_decode_omits_time_sync_when_block_absent(poll):
+    assert "time_sync" not in poll

@@ -20,18 +20,29 @@ class FakeBleakClient:
     """Minimal BleakClient stand-in with controllable teardown behaviour."""
 
     def __init__(
-        self, *, disconnect_hangs: bool = False, start_notify_raises: bool = False
+        self, *, disconnect_hangs: bool = False, start_notify_raises: bool = False,
+        reply: str | None = None,
     ):
         self._disconnect_hangs = disconnect_hangs
         self._start_notify_raises = start_notify_raises
+        self._reply = reply
+        self.written: list[bytes] = []
+        self._notify_cb = None
         self.start_notify_called = False
         self.stop_notify_called = False
         self.disconnect_called = False
 
     async def start_notify(self, _char, _cb) -> None:
         self.start_notify_called = True
+        self._notify_cb = _cb
         if self._start_notify_raises:
             raise RuntimeError("br-connection-canceled")
+
+    async def write_gatt_char(self, _char, payload, response=True) -> None:
+        """Record the AT payload and answer with the canned reply."""
+        self.written.append(bytes(payload))
+        if self._reply is not None and self._notify_cb is not None:
+            self._notify_cb(None, bytearray(self._reply.encode()))
 
     async def stop_notify(self, _char) -> None:
         self.stop_notify_called = True
@@ -126,3 +137,44 @@ def DeyeBleTransport_with_short_timeout(*, client_timeout: float):
     transport = t.DeyeBleTransport(ble_device=object())
     transport._disconnect_timeout = client_timeout
     return transport
+
+
+# --- Contiguous block write -------------------------------------------------
+# The clock is written as ONE frame because three single-register frames corrupt
+# the year byte on this hardware (see protocol.build_write_block).
+
+@pytest.mark.asyncio
+async def test_block_write_sends_one_frame_and_accepts_the_ack(patch_connect):
+    from custom_components.deye_ble import protocol as p
+
+    values = [0x1A08, 0x0F10, 0x2B00]
+    request = p.build_write_block(0x003E, values)
+    # A GENUINE ack: 8 bytes, no payload. Echoing the request back would not
+    # exercise the real response shape.
+    body = bytes((p.SLAVE, p.FUNC_WRITE, 0x00, 0x3E, 0x00, 0x03))
+    client = FakeBleakClient(reply="+ok=" + (body + p.crc16(body)).hex().upper())
+    patch_connect(client)
+
+    async with t.DeyeBleTransport(object()) as transport:
+        await transport.write_block(0x003E, values)
+
+    at_frames = [w for w in client.written if w.startswith(b"AT+INVDATA=")]
+    assert len(at_frames) == 1, "the clock must go out as a single frame"
+    assert request.hex().upper().encode() in at_frames[0]
+
+
+@pytest.mark.asyncio
+async def test_block_write_raises_when_the_ack_does_not_match(patch_connect):
+    # An unacked write must surface. It cannot confirm the VALUES — the ack
+    # echoes only address and quantity — but a missing or mismatched ack means
+    # the frame did not land at all, and silently continuing would leave the
+    # sequence believing it had written a clock it never wrote.
+    from custom_components.deye_ble import protocol as p
+
+    body = bytes((p.SLAVE, p.FUNC_WRITE, 0x00, 0x40, 0x00, 0x03))  # wrong address
+    client = FakeBleakClient(reply="+ok=" + (body + p.crc16(body)).hex().upper())
+    patch_connect(client)
+
+    async with t.DeyeBleTransport(object()) as transport:
+        with pytest.raises(t.DeyeBleError, match="not acked"):
+            await transport.write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])

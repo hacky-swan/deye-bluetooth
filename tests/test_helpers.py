@@ -1,12 +1,19 @@
 """Tests for the pure daily_calc and infer_grid_connected helpers."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
+from custom_components.deye_ble import registers as r
 from custom_components.deye_ble.helpers import (
+    clock_drift_seconds,
+    clock_within_tolerance,
     daily_calc,
     hold_spurious_total_resets,
     infer_grid_connected,
+    register_to_key,
+    time_of_day_drift_seconds,
 )
 
 _TODAY = date(2025, 6, 15)
@@ -131,3 +138,142 @@ def test_zero_prev_does_not_hold():
     prev = {"total_grid_import": 0.0}
     current = hold_spurious_total_resets(prev, {"total_grid_import": 0.0})
     assert current["total_grid_import"] == 0.0
+
+
+# --- Inverter clock drift ---------------------------------------------------
+
+def test_drift_positive_when_inverter_ahead():
+    drift = clock_drift_seconds(
+        datetime(2026, 8, 9, 10, 5, 30), datetime(2026, 8, 9, 10, 0, 0),
+    )
+    assert drift == 330
+
+
+def test_drift_negative_when_inverter_behind():
+    drift = clock_drift_seconds(
+        datetime(2025, 8, 9, 10, 40, 20), datetime(2025, 8, 9, 10, 41, 50),
+    )
+    assert drift == -90
+
+
+def test_drift_none_when_clock_unread():
+    # Missing reading must not read as "perfectly in sync".
+    assert clock_drift_seconds(None, datetime(2026, 8, 9, 10, 0, 0)) is None
+
+
+def test_drift_ignores_timezone_on_now():
+    # HA's dt_util.now() is tz-aware; the inverter reports bare wall clock. The
+    # aware side is stripped, not converted — there is nothing to convert to.
+    aware = datetime(2026, 8, 9, 10, 0, 0, tzinfo=timezone(timedelta(hours=10)))
+    assert clock_drift_seconds(datetime(2026, 8, 9, 10, 0, 30), aware) == 30
+
+
+def test_clock_registers_are_never_reasserted():
+    # The RTC legitimately changes every second, so it must never enter the
+    # local-wins drift-correction path — that would fight the inverter forever.
+    for offset in range(r.CLOCK_WORD_COUNT):
+        assert register_to_key(r.REG_CLOCK + offset) is None
+
+
+# --- Time-of-day drift (date ignored, wrapped) ------------------------------
+
+def test_time_of_day_drift_ignores_a_wrong_year():
+    # The live fault: RTC a year behind AND ~89 minutes fast. Total drift is
+    # ~-365 days, which buries the minutes; this is the sensor that sees them.
+    drift = time_of_day_drift_seconds(
+        datetime(2025, 8, 9, 10, 54, 43), datetime(2026, 8, 9, 9, 25, 19),
+    )
+    assert drift == 89 * 60 + 24
+
+
+def test_time_of_day_drift_positive_when_inverter_ahead():
+    drift = time_of_day_drift_seconds(
+        datetime(2026, 8, 9, 10, 5, 30), datetime(2026, 8, 9, 10, 0, 0),
+    )
+    assert drift == 330
+
+
+def test_time_of_day_drift_negative_when_inverter_behind():
+    drift = time_of_day_drift_seconds(
+        datetime(2026, 8, 9, 9, 58, 30), datetime(2026, 8, 9, 10, 0, 0),
+    )
+    assert drift == -90
+
+
+@pytest.mark.parametrize("inverter,now,expected", [
+    # Two minutes apart across midnight: the short way round, not 1438 minutes
+    # the wrong way. A wrap artefact here would mimic the very event we hunt.
+    (datetime(2026, 8, 10, 0, 1, 0), datetime(2026, 8, 9, 23, 59, 0), 120),
+    (datetime(2026, 8, 9, 23, 59, 0), datetime(2026, 8, 10, 0, 1, 0), -120),
+    # Same instant of day, different dates -> no time-of-day drift at all.
+    (datetime(2025, 1, 1, 12, 0, 0), datetime(2026, 8, 9, 12, 0, 0), 0),
+])
+def test_time_of_day_drift_wraps_the_short_way(inverter, now, expected):
+    assert time_of_day_drift_seconds(inverter, now) == expected
+
+
+def test_time_of_day_drift_never_exceeds_half_a_day():
+    # Every possible offset stays inside +/-12h, so the sensor can never report
+    # a wrap artefact of up to 24 hours.
+    now = datetime(2026, 8, 9, 0, 0, 0)
+    for minute in range(0, 24 * 60, 7):
+        inverter = now + timedelta(minutes=minute)
+        assert -43200 <= time_of_day_drift_seconds(inverter, now) <= 43200
+
+
+def test_time_of_day_drift_none_when_clock_unread():
+    assert time_of_day_drift_seconds(None, datetime(2026, 8, 9, 10, 0, 0)) is None
+
+
+def test_time_of_day_drift_ignores_timezone_on_now():
+    aware = datetime(2026, 8, 9, 10, 0, 0, tzinfo=timezone(timedelta(hours=10)))
+    assert time_of_day_drift_seconds(datetime(2026, 8, 9, 10, 0, 30), aware) == 30
+
+
+# --- Clock-write verification -----------------------------------------------
+# The clock is the one control that cannot use the strict verify_readback every
+# other register uses: it ticks while the sequence runs, so the readback is
+# *expected* to differ from what was written. It is accepted on drift instead.
+
+_VERIFY_NOW = datetime(2026, 8, 9, 10, 0, 0)
+_TOLERANCE = 90
+
+
+def test_verify_accepts_a_readback_that_has_ticked_on():
+    # The RTC advances during the commit + settle; a few seconds is success.
+    readback = r.encode_clock(_VERIFY_NOW + timedelta(seconds=8))
+    assert clock_within_tolerance(readback, _VERIFY_NOW, _TOLERANCE) is True
+
+
+def test_verify_rejects_the_observed_year_corruption():
+    # Regression test for the real fault: the year byte 0x1A landed as 0x7A,
+    # giving 2122, with month/day/hour/minute/second all correct. Everything a
+    # field-by-field check would compare still matches.
+    corrupted = r.encode_clock(_VERIFY_NOW)
+    corrupted[0] = (corrupted[0] & 0x00FF) | (0x7A << 8)
+    assert clock_within_tolerance(corrupted, _VERIFY_NOW, _TOLERANCE) is False
+
+
+def test_verify_rejects_an_undecodable_readback():
+    # Month 13 decodes to nothing. "Couldn't tell" must never mean "accept".
+    assert clock_within_tolerance([0x1A0D, 0x0908, 0x3800], _VERIFY_NOW, _TOLERANCE) is False
+
+
+def test_verify_rejects_a_short_readback():
+    assert clock_within_tolerance([0x1A08, 0x0908], _VERIFY_NOW, _TOLERANCE) is False
+
+
+@pytest.mark.parametrize("offset,expected", [
+    (90, True), (-90, True),     # exactly at tolerance is still a pass
+    (91, False), (-91, False),   # one second past it is not
+])
+def test_verify_tolerance_boundary(offset, expected):
+    readback = r.encode_clock(_VERIFY_NOW + timedelta(seconds=offset))
+    assert clock_within_tolerance(readback, _VERIFY_NOW, _TOLERANCE) is expected
+
+
+def test_verify_ignores_timezone_on_now():
+    # dt_util.now() is aware; the inverter reports a bare wall clock.
+    aware = datetime(2026, 8, 9, 10, 0, 0, tzinfo=timezone(timedelta(hours=10)))
+    readback = r.encode_clock(datetime(2026, 8, 9, 10, 0, 5))
+    assert clock_within_tolerance(readback, aware, _TOLERANCE) is True

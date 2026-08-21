@@ -139,6 +139,23 @@ class DeyeBleTransport:
         except p.ProtocolError as e:
             raise DeyeBleError(str(e)) from e
 
+    async def write_block(self, address: int, values: list[int]) -> None:
+        """Write a contiguous register range in ONE frame (see build_write_block).
+
+        Used by the clock commit, where three separate single-register frames
+        corrupt the year byte on this hardware.
+        """
+        request = p.build_write_block(address, values)
+        reply = await self._command(p.wrap_write(request))
+        try:
+            acked = p.parse_write_ack(reply, request)
+        except p.ProtocolError as e:
+            raise DeyeBleError(str(e)) from e
+        if not acked:
+            raise DeyeBleError(
+                f"block write to 0x{address:04X} not acked: {reply!r}"
+            )
+
     async def write(self, address: int, value: int) -> None:
         """Write a register and verify the ack echoes the address + quantity."""
         request = p.build_write(address, value)

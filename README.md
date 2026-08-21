@@ -168,6 +168,10 @@ flowchart TD
 | `bms_charge_current_limit` | BMS Charge Current Limit | A | `0x00D4` |
 | `bms_discharge_current_limit` | BMS Discharge Current Limit | A | `0x00D5` |
 | `daily_consumption` | Consumption Today | kWh | derived from `0x020F` |
+| `inverter_clock` | Inverter Clock | — | `0x003E`–`0x0040` (diagnostic) |
+| `clock_sync_result` | Clock Sync Result | — | last `sync_clock` outcome — `ok` / `skipped` / `failed` / `clock_wrong`, with `sync_id`/`sync_attempts`/`sync_at` |
+| `inverter_clock_drift` | Inverter Clock Drift | s | derived — snapshot taken at each clock read |
+| `inverter_time_of_day_drift` | Inverter Clock Drift (Time of Day) | s | derived — date ignored, wrapped to ±12 h |
 
 > Grid voltage phase order is L1, L3, L2 across `0x0273`–`0x0275`; only L2
 > (`0x0275`) was directly cross-checked against the app.
@@ -177,6 +181,7 @@ flowchart TD
 | Entity | Source | Description |
 |--------|--------|-------------|
 | `binary_sensor.grid_connected` | inferred from grid voltages | On when any grid phase is energised (>100 V); off when all phases collapse. No verified relay register, so it is derived rather than read. |
+| `binary_sensor.cloud_clock_sync_enabled` | `0x00E4` bit 0 | Time Sync — when off, the inverter accepts no cloud clock calibration and its RTC free-runs. Setting the time from the Deye app leaves this off silently; that is how the clock ended up a year out. |
 
 ### Controls
 
@@ -198,6 +203,78 @@ flowchart TD
 | Entity | Reason |
 |--------|--------|
 | `discharge_soc` (dedicated register) | No standalone register — implemented instead via the TOU non-charge slot SOCs (see Discharge SOC control) |
+
+## Services
+
+| Service | Description |
+|---------|-------------|
+| `deye_ble.dump_registers` | Diagnostic read-only sweep of holding registers to `/config/deye_register_dump.txt`. Args: `start`, `end`, `block`. |
+| `deye_ble.sync_clock` | Sets the inverter RTC to HA's local time, then refreshes so the entities reflect the result before the call returns. Optional `min_drift` (seconds) makes it a check that only writes when drift exceeds the threshold; called without it, it always syncs. Honours dry-run. |
+
+`sync_clock` is a sequence, not a write: the RTC commits its staged registers
+only when Time Sync (`0x00E4` bit 0) falls from on to off.
+
+```mermaid
+flowchart LR
+    A[read 0x00E4] --> B[set bit 0 — arm]
+    B --> C[settle]
+    C --> D[write 0x003E/0x003F/0x0040]
+    D --> E[clear bit 0 — RTC latches]
+    E --> F[read back, verify by drift]
+    F --> G[set bit 0 — always ends ON]
+```
+
+Four properties are load-bearing, and each is paid for in evidence
+(`local-deye-cloud/docs/inverter-clock-2026-08-09.md`):
+
+- **The sequence always ends with Time Sync ON** — it does not restore the flag
+  to whatever it was. Time Sync off means the logger's cloud calibration cannot
+  reach the RTC, which is how the phone app silently broke the clock; finding it
+  off is a fault to repair, not a preference to preserve. It also matters for
+  safety: a final write of a *cleared* bit would itself be a falling edge, and
+  if an error had interrupted the three clock writes it would latch a mixture of
+  new and stale words — a new date against an old time. Ending on a rising edge
+  cannot commit anything, so that failure mode does not exist.
+- **One lock for the whole sequence, one session per attempt.** The lock keeps
+  polls out of an open commit window; the fresh session per attempt means a link
+  that has just errored never carries the next attempt.
+- **Verified by drift, not equality.** The clock ticks while the sequence runs,
+  so the read-back is compared against a freshly taken "now" with a 90 s
+  tolerance, and the target is re-derived on every retry. An undecodable
+  read-back is a failure.
+- **The read-back must be FRESH.** The logger caches read responses for a
+  variable window of at least 8 s (see [`docs/protocol.md`](docs/protocol.md)),
+  so a read taken just after a write can return a pre-write frame — which
+  decodes to a plausible time and would report success over a corrupted RTC.
+  Verification therefore discards frames identical to the one before them and
+  requires two consecutive *distinct* in-tolerance frames, because the cache can
+  refresh a moment before a write lands and produce one genuinely-new frame that
+  still predates it.
+- **A clock verified wrong is not the same as one that could not be verified.**
+  The first is evidence and earns a bounded extra push (nothing else corrects
+  this RTC, so giving up leaves the inverter on a bad date); the second is an
+  absence of evidence and does not. If the extension ends with the clock still
+  wrong, that is published as `clock_wrong` and alerted distinctly — a bad date
+  reported as a generic failure is the same silent-failure shape again.
+- **The outcome is published, not inferred.** `sensor.…_clock_sync_result`
+  reads `ok`/`failed` and carries `sync_id`, `sync_attempts` and `sync_at`. It
+  is its own entity, always available, because every other entity reports what
+  the device currently says and goes unavailable when polling fails — taking
+  its attributes with it. What we know about a finished sync stays true when
+  the radio drops. Verify by comparing `sync_id` against the value seen before
+  the call: a timestamp comparison would assume a monotonic wall clock, and
+  drift is a snapshot carried forward on a failed read, so both can report a
+  good sync as a failure.
+
+[`deploy/deye_clock.yaml`](deploy/deye_clock.yaml) drives it daily at 08:00 site
+time, which also carries the DST step onto the inverter's timezone-less clock.
+
+## Testing
+
+See [`docs/testing.md`](docs/testing.md) for the testing discipline this
+integration is held to — mutation-checking every behaviour, what a mutation
+report must distinguish, and how fakes are allowed to model hardware. Each rule
+there was paid for by a bug a green suite did not catch.
 
 ## Protocol
 

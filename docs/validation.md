@@ -85,3 +85,57 @@ time (or within a few seconds for fast-changing power values).
    times of day (sunny morning, midday peak, evening idle) to build confidence.
 7. **For controls**, test with dry-run ON first (confirm no GATT writes), then
    disable dry-run and test one control at a time with read-back verification.
+
+## Clock sync — live hardware validation (2026-08-21)
+
+Run against the live inverter (`68:79:C4:AA:6B:2F`) with HA 2026.6.3 polling
+normally throughout. The deliberate skews were applied from a PC over BLE
+(`local-deye-cloud/scripts/ble_set_time.py`) so that nothing under test was also
+the thing creating the fault.
+
+Skew targets were chosen to keep the inverter's wall clock clear of 11:00-14:00
+at all times — the inverter's own time-of-use slots key off this RTC, and
+parking it inside that window would exercise a schedule nobody asked for.
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Baseline `deye_ble.sync_clock` | drift -49 s -> -3 s, `ok`, 1 attempt |
+| 2 | Skew +1 h (RTC 17:26) | HA reported drift **+3598 s** |
+| 3 | Recover via service | -5 s, `ok`, 1 attempt, 21 s wall time |
+| 4 | Skew -1 h (RTC 15:28) | held across 2.5 min of polling |
+| 5 | Recover via service | -5 s, `ok`, **2 attempts**, 14 s wall time |
+| 6 | `min_drift: 300` with drift ~5 s | `skipped`, 0 attempts |
+| 7 | Trigger `automation.inverter_daily_clock_sync` | fresh `sync_id`, `skipped`, no alert raised |
+
+`binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled` read `on` before and
+after every step: Time Sync was never left disabled.
+
+The three entity IDs `deploy/deye_clock.yaml` predicted from the device slug are
+confirmed real — `sensor.deye_inverter_ble_clock_sync_result`,
+`sensor.deye_inverter_ble_inverter_clock_drift` and
+`binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled`. The first is
+load-bearing: a wrong ID there makes every run report stale.
+
+### The edge-trigger model is not established
+
+Both skews were applied as a plain `0x10` block write to `0x003E-0x0040` with no
+Time Sync manipulation at all, and both **latched and held** — step 4 survived
+2.5 minutes of polling and an independent read-back. So a falling edge on
+`0x00E4` bit 0 is *not* required for the RTC to accept a write.
+
+What this does NOT establish: the Time Sync bit was **ON** for every one of
+these writes, because `async_sync_clock` deliberately leaves it that way. The
+evidence is equally consistent with "the RTC accepts writes whenever Time Sync
+is ON, and the edge matters only when it is off" — which is exactly the state
+the phone app left behind when it silently broke the clock in the first place.
+
+The discriminating experiment is a plain block write with Time Sync **OFF**. It
+has not been run. Until it is, treat the arm/settle/edge sequence as insurance
+of unknown value rather than as either necessary or dead code.
+
+### Known lag
+
+`CONFIG_READ_INTERVAL` is 900 s, so the clock and drift sensors can sit up to
+15 minutes stale. Step 4's skew was invisible to HA for that reason and had to
+be confirmed by direct read. A dashboard showing a healthy drift is not evidence
+that the clock is healthy *now*; `sensor.…_clock_sync_result` is.

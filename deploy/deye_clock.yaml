@@ -1,0 +1,178 @@
+# Deye — Daily Inverter Clock Sync
+# ================================
+# The inverter's RTC free-runs at ~3.1 s/day slow and nothing corrects it. The
+# logger calibrates its OWN clock from the cloud each morning (~08:47 AEST) but
+# never propagates that to the inverter, so a local write is the only mechanism.
+#
+# The integration owns the hard part — see coordinator.async_sync_clock:
+#   read 0x00E4 -> set Time Sync bit -> settle -> write 0x3E/0x3F/0x40 ->
+#   clear the bit (this is what latches the RTC) -> set the bit again.
+# It retries and verifies by drift against a fresh "now".
+#
+# The sequence ALWAYS ends with Time Sync ON — it does not put the flag back the
+# way it found it. Off means the logger's cloud calibration cannot reach the
+# RTC, so finding it off is a fault to repair, not a state to preserve. It is
+# also the safe direction: a final write of a CLEARED bit is itself a falling
+# edge, and if an error had interrupted the three clock writes that edge would
+# latch a mixture of new and stale words — a new date against an old time.
+# Ending on a rising edge cannot commit anything.
+#
+# ```mermaid
+# sequenceDiagram
+#     participant A as Automation (08:00)
+#     participant I as deye_ble integration
+#     participant V as Inverter RTC
+#     A->>I: deye_ble.sync_clock
+#     I->>V: Time Sync on -> clock words -> Time Sync off
+#     V-->>I: RTC latched (verified by read-back drift)
+#     I->>V: Time Sync on (always) — re-enables cloud calibration
+#     I->>I: publish the result on sensor.…_clock_sync_result + refresh
+#     A->>A: check THIS run's outcome, notify Oscar only if it failed
+# ```
+#
+# DST: the inverter stores a bare wall clock with no timezone, so the October
+# transition has to ARRIVE as a write or it sits an hour out for six months.
+# The trigger fires at 08:00 *site* time, which HA's own timezone already
+# resolves, so the first sync after the transition carries the +1 h step. A
+# one-hour shift was confirmed to latch and hold on real hardware (2026-08-13).
+#
+# 08:00 is deliberately clear of the logger's own ~08:47 cloud calibration —
+# and that one touches the logger's clock only, so there is nothing to race.
+
+automation:
+  - id: deye_clock_daily_sync
+    alias: "Inverter — Daily Clock Sync"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time
+        at: "08:00:00"
+    action:
+      # Captured BEFORE the service call. The outcome is judged by IDENTITY —
+      # "is this a different sync than the one I could already see" — not by
+      # timestamp and not by a rolling window.
+      #
+      # Not a window, because a fixed one must be both longer than the worst
+      # case (3 attempts + re-enable + a full refresh is ~9 min of declared
+      # timeouts, before connection retries) and short enough to reject
+      # yesterday's result; no such number exists, and picking one by feel is
+      # how a verifier ends up trusting a stale success.
+      #
+      # Not a timestamp, because both sides would come from the wall clock. An
+      # NTP or manual step during the call can make a genuinely new result look
+      # older than the run that produced it, and a backwards step before the run
+      # can make a previous day's result look new. This feature exists because
+      # clocks are wrong; it cannot assume its own clock is monotonic.
+      - variables:
+          prior_sync_id: "{{ state_attr('sensor.deye_inverter_ble_clock_sync_result', 'sync_id') }}"
+
+      # The service returns only after the sequence AND a fresh read, so the
+      # attributes below are already post-sync. continue_on_error keeps us on
+      # the verify/notify path when the sync raises after exhausting retries.
+      # min_drift makes this a CHECK that may or may not write. Every sync is an
+      # opportunity to corrupt the RTC — two of three attempts landed a bad year
+      # on 2026-08-14 — so at ~3.1 s/day a 30 s threshold means a real write
+      # roughly every ten days instead of daily, for a clock still far tighter
+      # than the minute-resolution TOU slots need. The October DST step is
+      # 3600 s, so it clears the threshold on the first check after the
+      # transition with no special case.
+      #
+      # The threshold is HERE and not in the integration on purpose: calling
+      # deye_ble.sync_clock by hand must always sync.
+      #
+      # Note the EFFECTIVE band is narrower than 30 s. A reading can be up to
+      # one cache-refresh gap stale (CLOCK_CACHE_MAX_AGE, 10 s), so the
+      # integration skips only when |drift| clears the threshold by that margin
+      # — about 20 s in practice. Erring toward the write is deliberate: the
+      # write is only risky when the clock is actually wrong.
+      - action: deye_ble.sync_clock
+        continue_on_error: true
+        data:
+          min_drift: 30
+
+      # Wait for THIS run's outcome to appear, not for the drift to look right.
+      # Drift is a snapshot carried forward when a config read fails, so a good
+      # sync plus one failed poll is indistinguishable from a sync that never
+      # landed — an alarm built on it fires after successes and stays quiet
+      # after failures, which teaches people to ignore it.
+      # The `is not none` guard comes first: with no outcome at all (service
+      # never ran, integration not loaded, dry-run) there is nothing to compare,
+      # and that must take the failure path rather than raise in the template.
+      - wait_template: >
+          {{ state_attr('sensor.deye_inverter_ble_clock_sync_result', 'sync_id') is not none
+             and state_attr('sensor.deye_inverter_ble_clock_sync_result', 'sync_id') != prior_sync_id }}
+        timeout: "00:12:00"
+        continue_on_timeout: true
+
+      # sensor.deye_inverter_ble_inverter_clock_drift was confirmed against the
+      # live entity registry. sensor.…_clock_sync_result and
+      # binary_sensor.…_cloud_clock_sync_enabled are NEW entities, so their IDs
+      # are predicted from the same device slug — check BOTH in Developer Tools
+      # after the first restart before trusting this alert. The sync_result one
+      # is load-bearing: if its ID is wrong, every run reports stale.
+      - variables:
+          # The service's own verdict: it verified the read-back by drift
+          # against a fresh clock and re-enabled Time Sync, or it did not.
+          sync_id: "{{ state_attr('sensor.deye_inverter_ble_clock_sync_result', 'sync_id') }}"
+          # A MEMBERSHIP test, never the bare state string: every state here is
+          # a non-empty string and therefore truthy, so `not sync_ok` against
+          # "failed" would silently never fire. "skipped" counts as fine — the
+          # drift was inside the threshold, so not writing was the correct
+          # outcome, not a failure to write.
+          sync_ok: >
+            {{ states('sensor.deye_inverter_ble_clock_sync_result') in ['ok', 'skipped'] }}
+          # The loudest state this feature can report: we watched the RTC read a
+          # bad date and could not correct it, so it is still wrong right now.
+          clock_wrong: >
+            {{ is_state('sensor.deye_inverter_ble_clock_sync_result', 'clock_wrong') }}
+          skipped: "{{ is_state('sensor.deye_inverter_ble_clock_sync_result', 'skipped') }}"
+          attempts: "{{ state_attr('sensor.deye_inverter_ble_clock_sync_result', 'sync_attempts') | int(0) }}"
+          # Stale means THIS run never reported — service unavailable,
+          # integration not loaded, entity renamed, or an outcome left over from
+          # a previous run. Silence is not success.
+          stale: "{{ sync_id is none or sync_id == prior_sync_id }}"
+          drift: "{{ states('sensor.deye_inverter_ble_inverter_clock_drift') | int(9999) }}"
+          # Reported separately: the clock can be perfect while cloud
+          # calibration sits disabled, which is exactly the state that produced
+          # the original fault and stayed invisible for months.
+          cloud_sync_off: >
+            {{ is_state('binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled', 'off') }}
+
+      - if:
+          - condition: template
+            value_template: "{{ stale or not sync_ok or cloud_sync_off }}"
+        then:
+          - action: notify.mobile_app_phone_oscar
+            data:
+              title: >
+                {{ '🚨 DEYE CLOCK LEFT WRONG' if clock_wrong else '⚠️ Deye clock sync' }}
+              message: >
+                {% if clock_wrong %}
+                The inverter clock read back a BAD DATE and {{ attempts }}
+                attempts did not correct it. It is wrong RIGHT NOW and nothing
+                else will fix it — the logger's cloud calibration does not reach
+                this RTC. Run deye_ble.sync_clock by hand and watch it.
+                {% elif stale %}
+                Clock sync did not report back — the service may not have run.
+                {% elif not sync_ok %}
+                Clock sync could not be verified after {{ attempts }} attempt(s).
+                Drift is {{ drift }} s. The clock may be fine; we could not
+                confirm it.
+                {% endif %}
+                {% if cloud_sync_off %}
+                Time Sync is OFF on the inverter — cloud clock calibration is
+                disabled, so the RTC will free-run between daily syncs.
+                {% endif %}
+
+      # A pass that needed retries is a pass, but it means we are one BLE hiccup
+      # from a failed daily sync — worth knowing before it becomes a failure.
+      - if:
+          - condition: template
+            value_template: "{{ not stale and sync_ok and not skipped and attempts > 1 }}"
+        then:
+          - action: notify.mobile_app_phone_oscar
+            data:
+              title: "Deye clock sync — took {{ attempts }} attempts"
+              message: >
+                Clock synced, but not first time. Worth a look at the settle
+                timings if this repeats.

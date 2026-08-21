@@ -109,3 +109,78 @@ def test_parse_read_rejects_modbus_exception():
     full = (frame + p.crc16(frame)).hex()
     with pytest.raises(p.ProtocolError):
         p.parse_read("+ok=" + full)
+
+
+# --- Contiguous block write (0x10, quantity > 1) ----------------------------
+# The clock MUST go out this way: three separate quantity-1 frames corrupt the
+# year byte 4 times in 5 on this hardware, one block frame 0 in 5 (2026-08-15,
+# interleaved trial). See protocol.build_write_block.
+
+def test_block_write_frame_shape():
+    frame = p.build_write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])
+    body = frame[:-2]
+    assert body[0] == p.SLAVE
+    assert body[1] == p.FUNC_WRITE
+    assert body[2:4] == b"\x00\x3E"      # address
+    assert body[4:6] == b"\x00\x03"      # quantity = 3 registers, not 1
+    assert body[6] == 6                  # byte count = 2 per register
+    assert body[7:] == bytes.fromhex("1A080F102B00")
+    assert p.crc16(body) == frame[-2:]
+
+
+def test_block_write_is_one_frame_not_three():
+    # The whole point: a single frame carrying all three registers.
+    block = p.build_write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])
+    singles = [p.build_write(0x003E + i, v)
+               for i, v in enumerate([0x1A08, 0x0F10, 0x2B00])]
+    assert len(block) < sum(len(f) for f in singles)
+    assert p.parse_write_ack(f"+ok={block.hex().upper()}", block) is True
+
+
+def _real_ack(address: int, quantity: int) -> str:
+    """A GENUINE 0x10 ack: slave, function, address, quantity, CRC. No payload.
+
+    The earlier tests echoed the whole request back as the reply, which is not
+    what the device sends — so a change in response shape would not have been
+    caught. Eight bytes total.
+    """
+    body = bytes((
+        p.SLAVE, p.FUNC_WRITE,
+        (address >> 8) & 0xFF, address & 0xFF,
+        (quantity >> 8) & 0xFF, quantity & 0xFF,
+    ))
+    return "+ok=" + (body + p.crc16(body)).hex().upper()
+
+
+def test_block_write_accepts_a_real_eight_byte_ack():
+    request = p.build_write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])
+    ack = _real_ack(0x003E, 3)
+    assert len(bytes.fromhex(ack[4:])) == 8
+    assert p.parse_write_ack(ack, request) is True
+
+
+def test_block_write_rejects_an_ack_for_a_different_range():
+    request = p.build_write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])
+    assert p.parse_write_ack(_real_ack(0x0040, 3), request) is False   # address
+    assert p.parse_write_ack(_real_ack(0x003E, 1), request) is False   # quantity
+
+
+def test_an_ack_can_never_confirm_what_was_written():
+    """A protocol fact worth pinning: the ack carries NO payload.
+
+    Two writes of different values to the same range produce byte-identical
+    acks, so an acknowledged write says only "a frame of this shape arrived" —
+    never "these values landed". This is why the clock is verified by read-back,
+    and why nobody should later drop that read-back on the grounds that the
+    write was acknowledged.
+    """
+    clean = p.build_write_block(0x003E, [0x1A08, 0x0F10, 0x2B00])
+    corrupt = p.build_write_block(0x003E, [0x7A08, 0x0F10, 0x2B00])  # year 2122
+    ack = _real_ack(0x003E, 3)
+    assert p.parse_write_ack(ack, clean) is True
+    assert p.parse_write_ack(ack, corrupt) is True
+
+
+def test_block_write_rejects_an_empty_range():
+    with pytest.raises(ValueError):
+        p.build_write_block(0x003E, [])

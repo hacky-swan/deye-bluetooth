@@ -23,7 +23,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[str] = ["binary_sensor", "sensor", "number", "select", "switch", "time"]
+PLATFORMS: list[str] = [
+    "binary_sensor", "button", "sensor", "number", "select", "switch", "time",
+]
 
 
 async def async_setup_entry(hass, entry) -> bool:
@@ -82,6 +84,17 @@ async def async_setup_entry(hass, entry) -> bool:
         _LOGGER.warning("Register dump written to %s (%d lines)", path, text.count("\n") + 1)
 
     hass.services.async_register(DOMAIN, "dump_registers", _dump_registers_service)
+
+    async def _sync_clock_service(call):
+        """Set the inverter RTC to HA's local time (see coordinator.async_sync_clock)."""
+        # min_drift is optional and absent by default, so a human calling this
+        # service always gets a sync. Only the automation passes a threshold.
+        raw = call.data.get("min_drift")
+        await coordinator.async_sync_clock_and_refresh(
+            min_drift=None if raw is None else int(raw)
+        )
+
+    hass.services.async_register(DOMAIN, "sync_clock", _sync_clock_service)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
