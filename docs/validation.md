@@ -104,9 +104,9 @@ parking it inside that window would exercise a schedule nobody asked for.
 | 3 | Recover via service | -5 s, `ok`, 1 attempt, 21 s wall time |
 | 4 | Skew -1 h (RTC 15:28) | held across 2.5 min of polling |
 | 5 | Recover via service | -5 s, `ok`, **2 attempts**, 14 s wall time |
-| 8 | Press `button.deye_inverter_ble_sync_clock` | -5 s, `ok`, 2 attempts, 70 s |
 | 6 | `min_drift: 300` with drift ~5 s | `skipped`, 0 attempts |
 | 7 | Trigger `automation.inverter_daily_clock_sync` | fresh `sync_id`, `skipped`, no alert raised |
+| 8 | Press `button.deye_inverter_ble_sync_clock` | -5 s, `ok`, 2 attempts, 70 s |
 
 `binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled` read `on` before and
 after every step: Time Sync was never left disabled.
@@ -139,22 +139,35 @@ confirmed real — `sensor.deye_inverter_ble_clock_sync_result`,
 `binary_sensor.deye_inverter_ble_cloud_clock_sync_enabled`. The first is
 load-bearing: a wrong ID there makes every run report stale.
 
-### The edge-trigger model is not established
+### Time Sync is a gate, not an edge trigger
 
 Both skews were applied as a plain `0x10` block write to `0x003E-0x0040` with no
 Time Sync manipulation at all, and both **latched and held** — step 4 survived
-2.5 minutes of polling and an independent read-back. So a falling edge on
-`0x00E4` bit 0 is *not* required for the RTC to accept a write.
+2.5 minutes of polling and an independent read-back. The bit was ON, as
+`async_sync_clock` always leaves it.
 
-What this does NOT establish: the Time Sync bit was **ON** for every one of
-these writes, because `async_sync_clock` deliberately leaves it that way. The
-evidence is equally consistent with "the RTC accepts writes whenever Time Sync
-is ON, and the edge matters only when it is off" — which is exactly the state
-the phone app left behind when it silently broke the clock in the first place.
+That is the third leg of the experiment, and it settles the model:
 
-The discriminating experiment is a plain block write with Time Sync **OFF**. It
-has not been run. Until it is, treat the arm/settle/edge sequence as insurance
-of unknown value rather than as either necessary or dead code.
+| Time Sync | Toggle | Result |
+|---|---|---|
+| ON | on->off edge | commits (the shipped sequence, all of 2026-08-09 onward) |
+| ON | none | commits (1 trial 2026-08-15, 2 more here) |
+| OFF | none | **never** commits (0 of 10, targets spread 2020-2035, 2026-08-15) |
+
+So `0x00E4` bit 0 gates writes — ON accepts, OFF ignores — and the falling edge
+was a confound, present in every early sequence because we always put it there.
+The arm/settle/clear/re-enable dance is not the commit mechanism.
+
+It is still worth keeping, and not only from caution. Ending ON is what repairs
+the disabled-calibration state the phone app leaves behind, and the shipped
+sequence reads the flag before writing it, so an inverter found with Time Sync
+OFF gets its clock set *and* its cloud calibration restored in one pass. A
+simplified "just block-write it" path would silently do nothing on exactly the
+inverter that needs the most help.
+
+One thing still unverified: whether a gated write leaves the flag untouched. If
+the hardware clears it as a side effect, the device itself produces the state
+this whole feature exists to repair.
 
 ### Known lag
 
