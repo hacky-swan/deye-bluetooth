@@ -19,8 +19,15 @@ from . import protocol as p
 
 _LOGGER = logging.getLogger(__name__)
 
-WRITE_CHAR = "0000fec7-0000-1000-8000-00805f9b34fb"   # write-with-response
-NOTIFY_CHAR = "0000fed8-0000-1000-8000-00805f9b34fb"  # notify (CCCD enabled by bleak)
+WRITE_CHAR = "0000fec7-0000-1000-8000-00805f9b34fb"
+# The 0x0922 profile observed upstream replies on FED8. AP_* loggers with the
+# HF-LPx70-style FEE7 profile use FEC8 (notify) or FED6 (indicate) for
+# module->app UART data. Pick the first characteristic actually exposed.
+NOTIFY_CHARS = (
+    "0000fed8-0000-1000-8000-00805f9b34fb",
+    "0000fec8-0000-1000-8000-00805f9b34fb",
+    "0000fed6-0000-1000-8000-00805f9b34fb",
+)
 
 DEFAULT_TIMEOUT = 10.0  # seconds to await a notification reply
 CONNECT_ATTEMPTS = 3    # establish_connection retries transient proxy failures
@@ -54,6 +61,8 @@ class DeyeBleTransport:
         self._client: BleakClient | None = None
         self._reply: asyncio.Future[str] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._notify_char = NOTIFY_CHARS[0]
+        self._write_with_response = True
 
     async def __aenter__(self) -> "DeyeBleTransport":
         await self.connect()
@@ -76,6 +85,48 @@ class DeyeBleTransport:
             )
         except Exception as e:  # noqa: BLE001 — connect can raise many bleak errors
             raise DeyeBleError(f"connect failed: {e}") from e
+        # Select the GATT transport profile from the characteristics that are
+        # actually present. The original logger profile uses FED8 for replies;
+        # AP_* loggers based on the HF-LPx70 BLE profile expose FEC8/FED6
+        # instead. FEC7 is the UART write channel in both profiles, but on the
+        # standard FEE7 profile it is Write Without Response.
+        services = getattr(self._client, "services", None)
+        if services is not None and hasattr(services, "get_characteristic"):
+            write_char = services.get_characteristic(WRITE_CHAR)
+            if write_char is None:
+                available = self._gatt_summary(services)
+                await self.disconnect()
+                raise DeyeBleError(
+                    f"write characteristic {WRITE_CHAR} not found; GATT: {available}"
+                )
+
+            props = {str(p).lower() for p in getattr(write_char, "properties", [])}
+            self._write_with_response = "write" in props
+
+            selected = None
+            for uuid in NOTIFY_CHARS:
+                char = services.get_characteristic(uuid)
+                if char is None:
+                    continue
+                char_props = {str(p).lower() for p in getattr(char, "properties", [])}
+                if "notify" in char_props or "indicate" in char_props:
+                    selected = uuid
+                    break
+
+            if selected is None:
+                available = self._gatt_summary(services)
+                await self.disconnect()
+                raise DeyeBleError(
+                    f"no supported reply characteristic found; GATT: {available}"
+                )
+            self._notify_char = selected
+            _LOGGER.info(
+                "Deye BLE GATT profile: write=%s response=%s reply=%s",
+                WRITE_CHAR,
+                self._write_with_response,
+                self._notify_char,
+            )
+
         # start_notify can raise a raw bleak error. The GATT connection is ALREADY
         # open at this point, so on failure we MUST release it: the logger accepts
         # a single central and stops advertising while held, so a leaked link
@@ -83,10 +134,12 @@ class DeyeBleTransport:
         # restarted — an integration reload cannot undo it. Re-raise as
         # DeyeBleError so the coordinator's failure grace rides it out.
         try:
-            await self._client.start_notify(NOTIFY_CHAR, self._on_notify)
+            await self._client.start_notify(self._notify_char, self._on_notify)
         except Exception as e:  # noqa: BLE001 — notify can raise many bleak errors
             await self.disconnect()
-            raise DeyeBleError(f"start_notify failed: {e}") from e
+            raise DeyeBleError(
+                f"start_notify failed on {self._notify_char}: {e}"
+            ) from e
 
     async def disconnect(self) -> None:
         """Tear down the session, but never block on it.
@@ -102,13 +155,26 @@ class DeyeBleTransport:
         if client is None:
             return
         for coro, what in (
-            (client.stop_notify(NOTIFY_CHAR), "stop_notify"),
+            (client.stop_notify(self._notify_char), "stop_notify"),
             (client.disconnect(), "disconnect"),
         ):
             try:
                 await asyncio.wait_for(asyncio.shield(coro), self._disconnect_timeout)
             except Exception:  # noqa: BLE001 — teardown is best-effort, never raises
                 _LOGGER.debug("BLE %s did not complete cleanly", what, exc_info=True)
+
+    @staticmethod
+    def _gatt_summary(services) -> str:
+        """Compact characteristic/property list for unsupported logger profiles."""
+        rows = []
+        try:
+            for service in services:
+                for char in service.characteristics:
+                    props = ",".join(str(p) for p in getattr(char, "properties", []))
+                    rows.append(f"{char.uuid}[{props}]")
+        except Exception:  # noqa: BLE001 — diagnostics must never mask the real error
+            return "<unavailable>"
+        return "; ".join(rows) or "<empty>"
 
     def _on_notify(self, _char, data: bytearray) -> None:
         text = bytes(data).decode("ascii", errors="replace").strip()
@@ -119,7 +185,9 @@ class DeyeBleTransport:
         if self._client is None or self._loop is None:
             raise DeyeBleError("not connected")
         self._reply = self._loop.create_future()
-        await self._client.write_gatt_char(WRITE_CHAR, payload, response=True)
+        await self._client.write_gatt_char(
+            WRITE_CHAR, payload, response=self._write_with_response
+        )
         try:
             return await asyncio.wait_for(self._reply, self._timeout)
         except asyncio.TimeoutError as e:
