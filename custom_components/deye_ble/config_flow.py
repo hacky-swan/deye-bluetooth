@@ -40,17 +40,39 @@ _LOGGER = logging.getLogger(__name__)
 # The BLE device name is typically the logger serial number.
 SERVICE_UUID = "00000922-0000-1000-8000-00805f9b34fb"
 
+# Some DL1000B-WIFI loggers advertise as AP_<digits> without including the
+# 0x0922 service UUID in the advertisement. Home Assistant exposes the observed
+# advertisement as manufacturer ID 0x3030 with an AP_ name.
+DEYE_AP_MANUFACTURER_ID = 0x3030
+DEYE_AP_NAME_PREFIX = "AP_"
+
+
+def _is_deye_candidate(info) -> bool:
+    """Return whether an advertisement is a plausible Deye logger."""
+    service_uuids = {uuid.lower() for uuid in (info.service_uuids or [])}
+    if SERVICE_UUID in service_uuids:
+        return True
+
+    name = (info.name or "").upper()
+    manufacturer_data = info.manufacturer_data or {}
+    return (
+        name.startswith(DEYE_AP_NAME_PREFIX)
+        and DEYE_AP_MANUFACTURER_ID in manufacturer_data
+    )
+
 
 def _deye_devices(hass):
-    """Discovered BLE devices advertising the Deye logger service UUID.
+    """Discovered BLE devices that are plausible Deye logger candidates.
 
-    ``async_discovered_service_info``'s second positional arg is ``connectable``
-    (a bool), NOT a service-UUID filter — so we filter on service_uuids here.
+    Normal Deye advertisements are matched by service UUID. Some DL1000B-WIFI
+    units omit that UUID from advertising and instead appear as AP_<digits>
+    with manufacturer ID 0x3030; include those in the manual device picker so
+    the transport can perform the real GATT handshake.
     """
     return [
         info
         for info in async_discovered_service_info(hass)
-        if SERVICE_UUID in info.service_uuids
+        if _is_deye_candidate(info)
     ]
 
 
@@ -100,7 +122,7 @@ class DeyeBleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._discovered_name = info.name
                     return await self._finish_or_confirm()
 
-        # Build list of discovered BLE devices matching our service UUID.
+        # Build list of discovered BLE devices matching the supported advertisements.
         discovered = _deye_devices(self.hass)
         if not discovered:
             return self.async_abort(reason="no_devices_found")
